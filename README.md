@@ -1,72 +1,140 @@
-# kogkog - デッドマンズスイッチ SaaS
+# DMS — Dead Man's Switch SaaS
 
-B2B向け「デッドマンズスイッチ」SaaSのMVPを構築：企業管理者が死亡トリガーを発動すると、システムが個人データを削除し、資産情報と共に近親者に通知し、HRオフボーディングを自動化します。このPRはフェーズ1：二段階認証とアカウント基盤をカバーしています。
+## 📌 背景と目的
 
-## 技術スタック
-Next.js 16 (App Router) · Tailwind CSS · Prisma 5 · NextAuth v5 (credentials + JWT) · Supabase (PostgreSQL)
+不慮の事故等で従業員が亡くなった際、「本人のプライバシー（見られたくないデジタルデータ）」を完全に死守しつつ、遺族には「必要な手続き情報」だけを伝え、同時に企業側の「預託備品回収・人事労務手続き」をシームレスに完結させるB2B福利厚生型サスペンドシステム。
 
-## データモデル
-- `Company` → `User` (role: `ADMIN | EMPLOYEE`) → `Employee` (status: `PENDING → ACTIVE → DECEASED`)
-- `ActivationToken` — 管理者が発行する単一使用、7日間有効の招待コード
-- `BlacklistKeyword`, `AssetInfo`, `NextOfKin`, `OAuthConnection`, `Equipment` — 従業員の死亡前設定
-
-## 認証とルーティング
-- `proxy.ts` がロールベースのルート保護を実施：未認証 → `/login`、クロスロールアクセス → リダイレクト
-- JWTコールバックが`session.user`に`id`と`role`を公開
-
-## 管理者フロー
-- ステータスバッジ付き従業員一覧/詳細 (`PENDING / ACTIVE / DECEASED / REVOKED`)
-- トークン生成UI (`TokenPanel`) — コードを発行/再発行し、フォーマット済み`XXXX-XXXX-…`トークンをクリップボードにコピー
-- `POST /api/admin/employees` — トランザクション内でプレースホルダー`User`（`passwordHash`なし）経由でメールを予約；DB一意制約が同時競合を処理
-
-## 従業員アクティベーション
-`/activate`での2ステップフロー：
-1. `POST /api/activate` — トークンを検証（未使用、未期限切れ、従業員がまだ`PENDING`）
-2. `PUT /api/activate` — 選択した名前/メール/パスワードでプレースホルダー`User`を更新し、従業員を`ACTIVE`に切り替え、トークンを使用済みにマーク — すべて単一の`$transaction`内で実行
-
-```ts
-// アクティベーションは新しいUserを作成するのではなく、事前作成されたプレースホルダーを更新するため、
-// 管理者が予約したメールが重複として誤って拒否されることはありません。
-await prisma.$transaction([
-  prisma.user.update({ where: { id: employee.userId }, data: { name, email, passwordHash } }),
-  prisma.employee.update({ where: { id: employeeId }, data: { status: "ACTIVE" } }),
-  prisma.activationToken.update({ where: { id: validToken.id }, data: { usedAt: new Date() } }),
-]);
-```
-
-## 従業員ダッシュボードと設定
-- セットアップ進捗チェックリスト（近親者、資産情報、ブラックリストキーワード、Google OAuthプレースホルダー）
-- `section`判別子（`nextOfKin | assets | keywords`）を使用して`PUT /api/dashboard/settings`経由で設定を保存
-
-## 開発セットアップ
-`TOKEN_EXPIRY_MS`定数はAPIルートと`TokenPanel` UIの間で共有されます。`prisma/seed.ts`のシードスクリプトがサンプル企業+管理者（`admin@example.com / password123`）を作成します。
+常駐エージェントを極力使わず、企業管理者のトリガー（死亡確定ボタン）とクラウドAPI（OAuth）の連携によって安全にデータを処理する。
 
 ---
 
-## はじめに
+## 🛠 システム要件 & アーキテクチャ
 
-開発サーバーを起動：
+### 1. パージレイヤー（ユーザー尊厳死守）
 
-```bash
-npm run dev
-# または
-yarn dev
-# または
-pnpm dev
-# または
-bun dev
+- **Google API 連携**: 死亡トリガーと同時に、検索履歴・YouTube 視聴履歴・Google マップ移動履歴をパージ
+- **Gmail フィルタリング**: 事前登録した NGキーワード（例: 消費者金融、病名、マッチングアプリ）を含むメールをゴミ箱からも削除
+- **SNS 連携解除**: LINE 等のアカウント連携解除、または退会リクエスト
+- **ソフトデリートの担保**: 誤操作防止のため、削除データは30日間暗号化隔離（30日後に完全物理削除）
+
+### 2. エッセンシャルレイヤー（遺族向け実利）
+
+- **ミニマル PDF 生成**: 遺族に必要な資産情報（口座・保険等）だけを整理した PDF を生成
+- **シナリオステップ配信**: 1日後、3日後などのタイムラインで遺族へメール送信
+- **管理者コントロール**: 管理画面から遺族向けメールの「事前プレビュー」「送信の即時前倒し」「一時停止」を制御
+
+### 3. 企業向け：死亡退職対応・ガバナンスレイヤー
+
+- **アカウントエスクロー閲覧**: 業務引き継ぎのため、企業アカウントへの一時的な管理者閲覧プロキシを有効化
+- **業務ファイル自動サルベージ**: ローカル PC 内の特定ファイルを企業共有ドライブへ自動バックアップ
+- **備品返却指示書の自動生成**: 貸与備品リストと返却手順案内を自動作成し遺族向けメールに挿入
+- **バックオフィス To-Do 自動生成**（企業カスタマイズ対応）:
+  - 給与・支払停止（即時）
+  - 社会保険資格喪失（5日以内）
+  - 雇用保険資格喪失（10日以内）
+  - 住民税特別徴収切り替え（翌月10日まで）
+  - 【その他企業カスタマイズ】（各企業が自由にタスクを追加・編集可能）
+
+---
+
+## ⚡️ ユーザー体験（トリガー・フロー）
+
+1. **企業がユーザー招待**: 企業管理者が登録 → 社員へ「個別アクティベーションコード（1回使い捨てトークン）」を自動発行
+2. **生前設定**: 社員はコードでログイン、Google/SNS の OAuth 認可、見せて良い情報・消したいキーワードを設定
+3. **トリガー発動**: 死亡連絡を受けた人事が、管理画面の「死亡確定ボタン」を押す
+4. **パージ & タスク起動**: 個人データがパージされ、企業側アカウントがロック・閲覧モードへ。同時に人事労務の To-Do リストが生成される
+
+---
+
+## 🎯 実装進捗
+
+### Phase 1: 認証 & アカウント基盤 ✅ 完了
+
+- [x] 企業アカウント（Admin）と従業員アカウント（Employee）の2階層認証
+- [x] 企業 Admin による「従業員登録 & 個別アクティベーションコード（トークン）」生成・管理（再発行時は旧トークンを即時失効）
+- [x] 従業員によるコード入力でのアクティベート（2ステップ・TOCTOU 対策済み）
+- [x] `middleware.ts` によるロールベースのルート保護
+- [x] JWT セッションへ `id` / `role` / `companyId` を付与
+
+### Phase 2: ダッシュボード & 設定（生前） ✅ 完了
+
+- [x] 従業員：遺族向け「銀行・保険」情報入力フォーム（資産情報・近親者情報ともに AES-256-GCM 暗号化保存）
+- [x] 従業員：Google（Gmail/Activity History）連携用 OAuth 認証
+- [x] 従業員：「消したいキーワード（ブラックリスト）」の登録・保存
+- [x] 従業員：LINE OAuth 連携（有効期限の表示・期限切れ時の再連携促進 UI 付き）
+- [x] 企業 Admin：各従業員への「貸与備品」管理
+
+### Phase 3: トリガー & パージエンジン ⚠️ 一部完了
+
+- [x] 企業 Admin：「死亡確定（Trigger）」ボタンの実装（アトミック操作）
+- [x] Google Activity Controls API によるデータ削除（検索・YouTube・マップ履歴・スコープ設定済み）
+- [x] Gmail キーワードメールの全件削除（ページネーション対応・500件/回）
+- [ ] Gmail キーワードメールの一時隔離（復元可能ストレージへの退避）※現在は直接削除。Supabase Storage を使って仮実装予定
+- [x] LINE アクセストークン revoke
+- [x] `DELETE_DRY_RUN=true` による検証用 dryRun モード
+- [ ] 削除データの30日間暗号化隔離（ソフトデリート）※ Supabase Storage を使って仮実装予定
+- [ ] 社用アカウントのロック & 閲覧用プロキシ有効化 ※ M365/Google Workspace 等の外部システム連携が必要なため実装難度が高く、今回のスコープ外
+
+### Phase 4: 遺族向けステップ配信 & バックオフィス To-Do ⚠️ 一部完了
+
+- [ ] 備品返却指示を含んだ遺族向け手続き案内 PDF の自動生成（資産情報 PDF の生成・配信基盤は実装済み）
+- [x] 近親者へのメール通知（Mailtrap / Resend 対応・失敗時リトライ）
+- [x] 備品記録の削除（HR オフボーディング相当）
+- [ ] ステップメール配信（1日後・3日後などのタイムライン）
+- [ ] 遺族向けメールの「プレビュー」「配信加速/一時停止」コントロール
+- [ ] バックオフィス To-Do リストの自動生成（給与停止・社保・雇用保険・住民税）& 企業カスタムタスク
+
+---
+
+## 🔧 技術スタック
+
+| カテゴリ | 採用技術 |
+|---|---|
+| フレームワーク | Next.js 16 (App Router) |
+| スタイリング | Tailwind CSS 4 |
+| データベース | Supabase (PostgreSQL) + Prisma 5 |
+| 認証 | NextAuth v5 (credentials + JWT) |
+| バリデーション | Zod |
+| 暗号化 | AES-256-GCM（`lib/crypto.ts`） |
+| ファイルストレージ | Supabase Storage |
+| メール送信 | Mailtrap（開発）/ Resend（本番） |
+
+### データモデル
+
+```
+Company
+  └─ User (role: ADMIN | EMPLOYEE)
+       └─ Employee (status: PENDING → ACTIVE → DECEASED | REVOKED)
+            ├─ ActivationToken   # 単一使用・有効期限付き招待コード
+            ├─ BlacklistKeyword  # トリガー時に削除する Gmail キーワード
+            ├─ AssetInfo         # 資産情報（AES-256-GCM 暗号化）
+            ├─ NextOfKin         # 近親者連絡先
+            ├─ OAuthConnection   # Google / LINE OAuth トークン（暗号化・employeeId で管理）
+            └─ Equipment         # 貸与備品
 ```
 
-ブラウザで [http://localhost:3000](http://localhost:3000) を開いて結果を確認してください。
+---
 
-## 環境設定
+## 🚀 開発セットアップ
 
-1. `.env.example`を`.env`にコピー
-2. データベース接続文字列とNextAuth設定を構成
-3. `npx prisma migrate dev`でデータベースをセットアップ
-4. `npx prisma db seed`でサンプルデータをシード
+```bash
+# 1. 環境変数を設定
+cp .env.example .env
+# DATABASE_URL / AUTH_SECRET / ENCRYPTION_KEY 等を記入
 
-## 認証情報（開発用）
+# 2. データベースをセットアップ
+npx prisma migrate dev
+npx prisma db seed
 
-シード後、以下の認証情報でログイン可能：
+# 3. 開発サーバー起動
+npm run dev
+```
+
+### 開発用認証情報（seed 後）
+
 - 管理者: `admin@example.com / password123`
+
+### 検証環境の注意事項
+
+- `.env` の `DELETE_DRY_RUN=true` にすると Google・Gmail・LINE の削除 API および PDF 生成をスキップしてログのみ出力
+- メール送信は `SMTP_HOST` を Mailtrap に設定すると実際には送信されず受信ボックスで確認可能
